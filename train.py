@@ -292,6 +292,22 @@ PROMPT_DICT = {
     ),
 }
 
+ORCA_SYSTEM_PROMPT = """ 
+###System:
+You are an expert in the domains math, coding and logical thinking.
+You are there to help users solve tasks in these domains efficiently and accurately. 
+Follow these guidelines when responding to user instructions:
+    \n
+    1. **Understand the Task**: Carefully read and comprehend the given instruction or task description.
+    2. **Generate Detailed Responses**: Provide clear, concise, and detailed responses to address the user's task. Ensure the response is complete and accurate.
+    3. **Maintain Context**: Ensure that your response maintains the context of the task and addresses all aspects of the instruction.
+    4. **Use Appropriate Formatting**: Structure your responses in a readable and logical format, using bullet points, lists, or code blocks as necessary.
+    5. **Be Accurate and Concise**: Avoid unnecessary information. Be precise and to the point, ensuring the information is correct and useful.
+\n
+Now solve the following task based on the given instruction:
+\n
+"""
+
 # Dataset class
 class InstructionDataset(Dataset):
     def __init__(self, dataset, tokenizer, style="alpaca"):
@@ -317,6 +333,16 @@ class InstructionDataset(Dataset):
             sample = self.dataset[index]
             prompt = prompt_template.format_map(sample)
             example = prompt + sample['answer']
+        elif self.style == "orca_plus":
+            sample = self.dataset[index]
+            user_message = f"###Question:\n{sample['question']} \n\n ###Answer:"
+            messages = [
+                {"role": "system", "content": ORCA_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ]   
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            example = prompt + sample['answer']
+
         else: # Alpaca
             ann = self.dataset[index]
             if ann.get("input", "") == "":
@@ -346,11 +372,24 @@ class InstructionDataset(Dataset):
             "attention_mask":example_mask.tolist(),
         }
 
+# Define a function to filter by category and sample the required number of examples
+def sample_category(dataset, category, num_samples):
+    filtered_dataset = dataset.filter(lambda x: x['task'] == category)
+    sampled_dataset = filtered_dataset.shuffle(seed=42).select(range(num_samples))
+    return sampled_dataset
+
+# Normalize the structure of the Orca Math dataset
+def normalize_to_qa(example):
+    return {
+        'question': example['instruction'],
+        'answer': example['response']
+    }
+
 # And to get the dataloader
 def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
     """Creates a dataset and appropriate dataloader with distributed sampler."""
     # Importing here rather than at the start to avoid multiprocessing issues
-    from datasets import Dataset, load_dataset
+    from datasets import Dataset, load_dataset, concatenate_datasets
 
     # Load the source dataset
     if args["dataset"] == "alpaca":
@@ -374,6 +413,34 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
         # train with 10k for starters. Then 100k.
         dataset = dataset.select(range(0,args['dataset_samples']))
 
+
+    elif args["dataset"] == "orca_plus":
+        ultra_interact = load_dataset("openbmb/UltraInteract_sft", split='train')
+        orca_math = load_dataset("microsoft/orca-math-word-problems-200k", split='train')
+
+        # Sample the required number of examples from each category
+        logic_examples = sample_category(ultra_interact, "Logic", args['dataset_samples']/8)
+        math_pot_examples = sample_category(ultra_interact, "Math_PoT", args['dataset_samples']/16)
+        math_cot_examples = sample_category(ultra_interact, "Math_CoT", args['dataset_samples']/16)
+        coding_examples = sample_category(ultra_interact, "Coding", args['dataset_samples']/4)
+
+        # Remove unnecessary columns from UltraInteract datasets
+        logic_examples = logic_examples.remove_columns([col for col in logic_examples.column_names if col not in ['instruction', 'response']])
+        math_pot_examples = math_pot_examples.remove_columns([col for col in math_pot_examples.column_names if col not in ['instruction', 'response']])
+        math_cot_examples = math_cot_examples.remove_columns([col for col in math_cot_examples.column_names if col not in ['instruction', 'response']])
+        coding_examples = coding_examples.remove_columns([col for col in coding_examples.column_names if col not in ['instruction', 'response']])
+
+        all_ultra_interact = concatenate_datasets([logic_examples, math_pot_examples, math_cot_examples, coding_examples])
+
+        all_ultra_interact = all_ultra_interact.map(normalize_to_qa)
+        all_ultra_interact = all_ultra_interact.remove_columns([col for col in all_ultra_interact.column_names if col not in ['question', 'answer']])
+
+        orca_math_examples = orca_math.shuffle(seed=42).select(range(args['dataset_samples']/2))
+
+        dataset = concatenate_datasets([orca_math_examples, all_ultra_interact])
+        dataset = dataset.shuffle(seed=42)
+
+
     # truncate dataset so it's evenly divisible by grad_accumulation_steps
     dataset = dataset.select(range(0, len(dataset)-len(dataset)%(args["batch_size"]*args["gradient_accumulation_steps"])))
 
@@ -384,6 +451,8 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
         dataset = InstructionDataset(dataset, tokenizer, style="qna")
     elif args["dataset"] == "orca_math":
         dataset = InstructionDataset(dataset, tokenizer, style="qna_no_ctx")
+    elif args["dataset"] == "orca_plus":
+        dataset = InstructionDataset(dataset, tokenizer, style="orca_plus")
     else: # (w/ alpaca prompt formatting)
         dataset = InstructionDataset(dataset, tokenizer, style="alpaca")
 
@@ -1042,7 +1111,7 @@ def fsdp_qlora(
     context_length: int = 512, # Max length of input sequence (in tokens)
     gradient_accumulation_steps: int = 1, # How many steps to accumulate gradients over (increases effective batch size)
     num_epochs: int = 1, # How many epochs of training to do
-    dataset: str = "alpaca_sample", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
+    dataset: str = "orca_plus", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
     dataset_samples: int = 512, # Number of samples in an epoch if using "alpaca_sample" or "dummy" dataset
     sharding_strategy: str = "full_shard", # Sharding strategy for FSDP
     use_gradient_checkpointing: bool = True, # Use FSDP's activation checkpointing
@@ -1104,7 +1173,7 @@ def fsdp_qlora(
         context_length: Max length of input sequence (in tokens)
         gradient_accumulation_steps: How many steps to accumulate gradients over (increases effective batch size)
         num_epochs: How many epochs of training to do
-        dataset: alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
+        dataset: orca_plus, alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
         dataset_samples: Number of samples in an epoch if using "alpaca_sample" or "dummy" dataset
         sharding_strategy: Sharding strategy for FSDP
         use_gradient_checkpointing: Use FSDP's activation checkpointing
@@ -1191,7 +1260,7 @@ def main(
     context_length: int = 512, # Max length of input sequence (in tokens)
     gradient_accumulation_steps: int = 1, # How many steps to accumulate gradients over (increases effective batch size)
     num_epochs: int = 1, # How many epochs of training to do
-    dataset: Param("", choices=["alpaca", "alpaca_sample", "dummy", "guanaco", "sql", "orca_math"]) = "alpaca_sample", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
+    dataset: Param("", choices=["alpaca", "alpaca_sample", "dummy", "guanaco", "sql", "orca_math", "orca_plus"]) = "orca_plus", # orca_plus, alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
     dataset_samples: int = 512, # Number of samples in an epoch if using "alpaca_sample" or "dummy" dataset
     sharding_strategy: Param("", choices=["full_shard", "shard_grad_op", "ddp", "hybrid_full_shard", "hybrid_shard_grad_op"]) = "full_shard", # Sharding strategy for FSDP
     use_gradient_checkpointing: bool_arg = True, # Use FSDP's activation checkpointing
